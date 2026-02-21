@@ -20,10 +20,10 @@ def main():
         default="config.json",
         help="Path to config file (will be created if not exists)",
     )
-    parser.add_argument("--num-epochs", type=int, default=1500)
-    parser.add_argument("--n-features", type=int, default=5)
-    parser.add_argument("--n-samples", type=int, default=30)
-    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--num-epochs", type=int, default=None)
+    parser.add_argument("--n-features", type=int, default=None)
+    parser.add_argument("--n-samples", type=int, default=None)
+    parser.add_argument("--learning-rate", type=float, default=None)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint")
     parser.add_argument("--no-early-stopping", action="store_true", help="Disable early stopping")
@@ -36,11 +36,11 @@ def main():
     if config_path.exists():
         config = Config.load(args.config)
         print(f"Loaded config from {args.config}")
-        # Apply CLI overrides
-        config.num_epochs = args.num_epochs
-        config.n_features = args.n_features
-        config.n_samples = args.n_samples
-        config.learning_rate = args.learning_rate
+        # Only apply CLI overrides when explicitly provided (not default None)
+        if args.num_epochs   is not None: config.num_epochs    = args.num_epochs
+        if args.n_features   is not None: config.n_features    = args.n_features
+        if args.n_samples    is not None: config.n_samples     = args.n_samples
+        if args.learning_rate is not None: config.learning_rate = args.learning_rate
         if args.device != "auto":
             config.device = args.device
         # Always resolve "auto" to an actual device string
