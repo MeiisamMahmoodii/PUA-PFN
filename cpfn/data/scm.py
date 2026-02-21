@@ -54,17 +54,18 @@ class CausalMechanism(nn.Module):
         """
         x:     [n_samples, n_parents]
         noise: [n_samples]
-        Returns: [n_samples]
+        Returns: [n_samples]  clamped to [-20, 20] for training stability
         """
         if self.model is None:
-            return noise
-        return self.model(x).view(-1) + noise
+            return noise.clamp(-20, 20)
+        out = self.model(x).view(-1) + noise
+        return out.clamp(-20, 20)
 
 
 class _Square(nn.Module):
-    """Element-wise square nonlinearity (x^2)."""
+    """Scaled element-wise square: tanh(x)^2, bounded to (-1, 1)."""
     def forward(self, x):
-        return x ** 2
+        return torch.tanh(x) ** 2
 
 
 def generate_full_multiverse(
@@ -101,9 +102,9 @@ def generate_full_multiverse(
         adj:        [n_features, n_features] adjacency matrix
     """
     if randomise_prior:
-        edge_prob = random.uniform(0.1, 0.5)
-        do_val    = random.uniform(2.0, 15.0)
-        sigma_exo = random.uniform(0.5, 3.0)
+        edge_prob  = random.uniform(0.1, 0.5)
+        do_val     = random.uniform(2.0, 10.0)   # reduced ceiling: keep within [-20, 20] borders
+        sigma_exo  = random.uniform(0.5, 2.0)    # reduced ceiling to stay in range
         noise_type = random.choice(["gaussian", "laplace"])
         gamma      = random.choice(["relu", "tanh", "square"])
     else:

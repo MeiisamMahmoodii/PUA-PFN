@@ -29,30 +29,37 @@ def sparsity_loss(
     pred_means: torch.Tensor,
     obs_means:  torch.Tensor,
     true_targets: torch.Tensor,
-    threshold: float = 0.3,
 ) -> torch.Tensor:
     """
-    Push model predictions towards zero for non-causal (non-descendant) variables.
+    Stable sparsity penalty: push predictions for non-descendants toward obs baseline.
 
-    For each variable whose true interventional value is close to the
-    observational value (i.e., no causal effect), penalise the model
-    for predicting a large deviation from the observational baseline.
+    Uses:
+    - Relative threshold: 20% of per-universe interquartile range (scale-adaptive)
+    - L1 penalty (not L2) — no squaring, can't explode
+    - Hard clamp to [0, 5] — caps contribution from any single batch
 
     Args:
-        pred_means:   [K, s, f]  model's mean predictions per universe
-        obs_means:    [s, f]     observational means (broadcast over K)
+        pred_means:   [K, s, f]  model mean predictions per universe
+        obs_means:    [s, f]     observational world values
         true_targets: [K, s, f]  ground-truth interventional values
-        threshold:    if |true_delta| < threshold → treat as zero-effect
-
-    Returns:
-        scalar sparsity penalty
     """
-    true_deltas = (true_targets - obs_means.unsqueeze(0)).abs()  # [K, s, f]
-    pred_deltas = (pred_means   - obs_means.unsqueeze(0)).abs()  # [K, s, f]
+    true_deltas = (true_targets - obs_means.unsqueeze(0)).abs()   # [K, s, f]
+    pred_deltas = (pred_means   - obs_means.unsqueeze(0)).abs()   # [K, s, f]
 
-    non_causal_mask = true_deltas < threshold
-    penalty = pred_deltas[non_causal_mask].pow(2).mean()
-    return penalty
+    # Scale-adaptive threshold: 20% of the per-universe 75th-percentile delta
+    scale = true_deltas.reshape(true_deltas.shape[0], -1).quantile(0.75, dim=-1)  # [K]
+    threshold = (0.20 * scale).clamp(min=0.1)   # at least 0.1 absolute
+
+    # Expand threshold to match [K, s, f]
+    thr = threshold.view(-1, 1, 1).expand_as(true_deltas)
+    non_causal_mask = true_deltas < thr
+
+    if non_causal_mask.sum() == 0:
+        return torch.tensor(0.0, device=pred_means.device)
+
+    # L1, not L2 — stable with any prediction magnitude
+    penalty = pred_deltas[non_causal_mask].mean()
+    return penalty.clamp(max=5.0)
 
 
 # ──────────────────────────────────────────────── #
@@ -156,6 +163,11 @@ class Trainer:
 
         # ── Total loss ───────────────────────────────────────────────── #
         loss = nll + self.lambda_sparsity * sp_loss
+
+        # ── NaN guard — skip bad batches, don't corrupt model state ──── #
+        if not torch.isfinite(loss):
+            self.optimizer.zero_grad()
+            return {"loss": float("nan"), "nll": float("nan"), "sparsity": float("nan")}
 
         # ── Backward ─────────────────────────────────────────────────── #
         loss.backward()

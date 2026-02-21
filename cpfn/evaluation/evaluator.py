@@ -161,10 +161,24 @@ class CausalDiscoveryEvaluator:
             true_deltas = (true_world - obs_world).abs().mean(dim=0)   # [f]
             pred_deltas = (pred_world - obs_world).abs().mean(dim=0)   # [f]
 
-            # Edge detection: threshold on PREDICTED deltas (not true deltas)
-            # Use 15% of the intervened variable's predicted delta as threshold
-            int_pred_delta = pred_deltas[target_node].item()
-            pred_threshold = max(int_pred_delta * 0.15, 0.1)
+            # Edge detection: find the natural gap in PREDICTED deltas.
+            # Sort all non-self predicted deltas; use the midpoint between the
+            # two largest and two smallest as threshold. This is robust whether
+            # the model has learned to predict low for the intervened var or not.
+            non_self_deltas = torch.stack([
+                pred_deltas[i] for i in range(n_features) if i != target_node
+            ])
+            sorted_deltas, _ = non_self_deltas.sort(descending=True)
+
+            if len(sorted_deltas) >= 2:
+                # Gap-based threshold: halfway between highest and lowest pred delta
+                # among non-self variables
+                gap_threshold = (sorted_deltas[0] + sorted_deltas[-1]) / 2.0
+                pred_threshold = gap_threshold.item()
+            else:
+                pred_threshold = non_self_deltas.mean().item() * 0.5
+
+            pred_threshold = max(pred_threshold, 0.05)
 
             pred_edges_this = set()
             for i in range(n_features):
