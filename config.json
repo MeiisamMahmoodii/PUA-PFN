@@ -1,7 +1,7 @@
 {
   "n_features": 5,
-  "embed_dim": 256,
-  "n_heads": 16,
+  "embed_dim": 192,
+  "n_heads": 12,
   "n_decoder_layers": 8,
   "num_epochs": 5000,
   "n_samples": 500,
