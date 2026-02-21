@@ -104,9 +104,10 @@ class Trainer:
         )
 
         # Fix bar-distribution borders once (stable NLL scale across all batches).
-        # Range [-30, 30] covers: do_val in [2,15] + mechanism amplification + obs noise.
+        # Tightened to [-15, 15]: do_val<=10 + mechanisms clamped to [-20,20],
+        # typical values stay within this range. Tighter = finer bins = better gradients.
         self.model.bar_head.init_fixed_borders(
-            y_min=-30.0, y_max=30.0, device=torch.device(device)
+            y_min=-15.0, y_max=15.0, device=torch.device(device)
         )
 
         # Logging
@@ -170,8 +171,9 @@ class Trainer:
         sp_loss = sparsity_loss(gated_means, obs_world, targets)
 
         # ── Total loss ───────────────────────────────────────────────── #
-        # BCE weight 1.0 — direct adjacency supervision is the primary gate signal
-        loss = nll + self.lambda_sparsity * sp_loss + gate_bce + 0.05 * gate_sp
+        # NLL is primary; gate_bce weight 0.2 — auxiliary graph supervision
+        # (was 1.0 before which overwhelmed NLL causing divergence after epoch 100)
+        loss = nll + self.lambda_sparsity * sp_loss + 0.2 * gate_bce + 0.05 * gate_sp
 
         # ── NaN guard ────────────────────────────────────────────────── #
         if not torch.isfinite(loss):
@@ -209,28 +211,34 @@ class Trainer:
     #  Validation                                                          #
     # ------------------------------------------------------------------ #
 
-    def validate(self, n_eval_samples: int = 15) -> float:
+    def validate(self, n_eval_samples: int = 15, n_trials: int = 5) -> float:
+        """
+        Average F1 over n_trials independently sampled SCMs.
+        A single random SCM can give wildly high/low F1 by luck.
+        Averaging over 5 SCMs gives a stable signal for checkpointing.
+        """
         self.model.eval()
         if self.evaluator is None:
             self.evaluator = CausalDiscoveryEvaluator(self.model, device=self.device)
 
+        f1_scores = []
         with torch.no_grad():
-            # Use infer mode: obs data + query token + gap threshold
-            # This works regardless of gate training progress
-            metrics = self.evaluator.evaluate(
-                n_samples=n_eval_samples,
-                n_features=self.n_features,
-                do_val=10.0,
-                verbose=False,
-                mode="infer",
-            )
+            for _ in range(n_trials):
+                metrics = self.evaluator.evaluate(
+                    n_samples=n_eval_samples,
+                    n_features=self.n_features,
+                    do_val=10.0,
+                    verbose=False,
+                    mode="infer",
+                )
+                f1_scores.append(metrics["f1"])
 
-        f1 = metrics["f1"]
+        avg_f1 = sum(f1_scores) / len(f1_scores)
         self.model.train()
         self.evaluator = None
         if self.device == "cuda":
             torch.cuda.empty_cache()
-        return f1
+        return avg_f1
 
     # ------------------------------------------------------------------ #
     #  Full training loop                                                  #
