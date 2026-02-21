@@ -106,10 +106,12 @@ class CausalGate(nn.Module):
         probs  = torch.sigmoid(logits) * self.diag_mask
         return probs.clamp(0.0, 1.0)
 
-    def hard_adjacency(self, obs_context: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:
+    def hard_adjacency(self, obs_context: torch.Tensor, threshold: float = 0.15) -> torch.Tensor:
         """
         [K, K] binary adjacency matrix given obs_context.
-        Use at inference time.
+        Default threshold 0.15: BCE-trained gate probs settle at ~0.01-0.02 for
+        non-edges and ~0.25-0.35 for causal edges, so 0.15 cleanly separates them.
+        Adjust if scale changes significantly.
         """
         return (self.edge_probs(obs_context) > threshold).float()
 

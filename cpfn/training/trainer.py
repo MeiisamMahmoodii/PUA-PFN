@@ -104,10 +104,10 @@ class Trainer:
         )
 
         # Fix bar-distribution borders once (stable NLL scale across all batches).
-        # Tightened to [-15, 15]: do_val<=10 + mechanisms clamped to [-20,20],
-        # typical values stay within this range. Tighter = finer bins = better gradients.
+        # [-25, 25]: headroom for do_val<=10 + mechanism amplification,
+        # without the saturation at boundary that [-15,15] caused in infer mode.
         self.model.bar_head.init_fixed_borders(
-            y_min=-15.0, y_max=15.0, device=torch.device(device)
+            y_min=-25.0, y_max=25.0, device=torch.device(device)
         )
 
         # Logging
