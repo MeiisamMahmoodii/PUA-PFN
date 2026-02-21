@@ -25,7 +25,7 @@ class CausalDiscoveryEvaluator:
     - NLL of predicted bar-distribution over true interventional outcomes
     """
 
-    def __init__(self, model: nn.Module, device: str = "cpu"):
+    def __init__(self, model: nn.Module, device: str = "cuda" if torch.cuda.is_available() else "cpu"):
         self.model  = model.to(device)
         self.device = device
 
@@ -62,13 +62,11 @@ class CausalDiscoveryEvaluator:
     def _train_mode_evaluate(self, n_samples, n_features, do_val, verbose) -> Dict:
         self.model.eval()
 
-        # Generate ground truth
         m_true, adj = generate_full_multiverse(
             n_samples, n_features, do_val=do_val,
             randomise_prior=False, device=self.device
         )
 
-        # Set bar-distribution borders based on target range
         targets_flat = m_true[1:].reshape(-1)
         self.model.bar_head.set_borders(
             targets_flat.min().item(),
@@ -77,10 +75,20 @@ class CausalDiscoveryEvaluator:
         )
 
         with torch.no_grad():
-            logits = self.model(m_true)   # [K, s*f, n_bins]
+            logits, gated_means, gate = self.model(m_true)   # tuple
+
+        # Edge prediction: use learned Gumbel-Sigmoid gate (principled, no threshold heuristic)
+        pred_adj = self.model.causal_gate.hard_adjacency()   # [K, K] binary
+        predicted_edges = {
+            (i, j)
+            for i in range(n_features)
+            for j in range(n_features)
+            if i != j and pred_adj[i, j].item() > 0.5
+        }
 
         return self._compute_metrics(
-            logits, m_true, adj, n_samples, n_features, verbose, mode="train"
+            logits, m_true, adj, n_samples, n_features, verbose,
+            mode="train", predicted_edges=predicted_edges
         )
 
     # ------------------------------------------------------------------ #
@@ -123,7 +131,8 @@ class CausalDiscoveryEvaluator:
     # ------------------------------------------------------------------ #
 
     def _compute_metrics(
-        self, logits, m_true, adj, n_samples, n_features, verbose, mode
+        self, logits, m_true, adj, n_samples, n_features, verbose, mode,
+        predicted_edges=None  # if provided (train mode), skip gap-threshold computation
     ) -> Dict:
         true_edges = set()
         edges = torch.where(adj > 0)
@@ -137,72 +146,70 @@ class CausalDiscoveryEvaluator:
             print(f"{'='*70}")
             print(f"True DAG Edges: {sorted(list(true_edges))}")
 
-        obs_world = m_true[0]   # [n_samples, n_features]
-        all_pred_edges = {}
-        total_nll = 0.0
+        obs_world   = m_true[0]
+        total_nll   = 0.0
+        # For infer mode or verbose delta table, track per-intervention edges
+        gap_pred_edges = {}
 
         for u_idx in range(n_features):
             target_node = u_idx
-            true_world  = m_true[u_idx + 1]  # [n_samples, n_features]
+            true_world  = m_true[u_idx + 1]
 
-            # Get mean prediction from bar-distribution
-            logits_u   = logits[u_idx]   # [s*f, n_bins]
-            mean_pred  = self.model.bar_head.mean(logits_u)   # [s*f]
+            logits_u   = logits[u_idx]
+            mean_pred  = self.model.bar_head.mean(logits_u)
             pred_world = mean_pred.view(n_samples, n_features)
 
-            # Bar-distribution NLL on true interventional outcomes
-            nll = self.model.bar_head.nll_loss(
-                logits_u,
-                true_world.reshape(-1)
-            )
+            nll = self.model.bar_head.nll_loss(logits_u, true_world.reshape(-1))
             total_nll += nll.item()
 
-            # Deltas
-            true_deltas = (true_world - obs_world).abs().mean(dim=0)   # [f]
-            pred_deltas = (pred_world - obs_world).abs().mean(dim=0)   # [f]
+            true_deltas = (true_world - obs_world).abs().mean(dim=0)
+            pred_deltas = (pred_world - obs_world).abs().mean(dim=0)
 
-            # Edge detection: find the natural gap in PREDICTED deltas.
-            # Sort all non-self predicted deltas; use the midpoint between the
-            # two largest and two smallest as threshold. This is robust whether
-            # the model has learned to predict low for the intervened var or not.
+            # Gap threshold (used in infer mode, and for verbose display)
             non_self_deltas = torch.stack([
                 pred_deltas[i] for i in range(n_features) if i != target_node
             ])
-            sorted_deltas, _ = non_self_deltas.sort(descending=True)
-
-            if len(sorted_deltas) >= 2:
-                # Gap-based threshold: halfway between highest and lowest pred delta
-                # among non-self variables
-                gap_threshold = (sorted_deltas[0] + sorted_deltas[-1]) / 2.0
-                pred_threshold = gap_threshold.item()
+            sorted_d, _ = non_self_deltas.sort(descending=True)
+            if len(sorted_d) >= 2:
+                gap_threshold = (sorted_d[0] + sorted_d[-1]) / 2.0
             else:
-                pred_threshold = non_self_deltas.mean().item() * 0.5
+                gap_threshold = non_self_deltas.mean() * 0.5
+            gap_threshold = max(gap_threshold.item(), 0.05)
 
-            pred_threshold = max(pred_threshold, 0.05)
-
-            pred_edges_this = set()
+            gap_edges_this = set()
             for i in range(n_features):
-                if i != target_node and pred_deltas[i].item() > pred_threshold:
-                    pred_edges_this.add((target_node, i))
-
-            all_pred_edges[target_node] = pred_edges_this
+                if i != target_node and pred_deltas[i].item() > gap_threshold:
+                    gap_edges_this.add((target_node, i))
+            gap_pred_edges[target_node] = gap_edges_this
 
             if verbose:
+                # In train mode, show gate probs alongside
+                show_gate = (mode == "train" and hasattr(self.model, "causal_gate"))
+                gate_probs = self.model.causal_gate.edge_probs().detach() if show_gate else None
+
                 print(f"\n--- Intervention on X{target_node} ---")
-                print("Variable | True Δ | Pred Δ | Predicted edge?")
-                print("-" * 54)
+                header = "Variable | True Δ | Pred Δ | Gate P" if show_gate else "Variable | True Δ | Pred Δ"
+                print(header)
+                print("-" * (60 if show_gate else 40))
                 for i in range(n_features):
                     td = true_deltas[i].item()
                     pd = pred_deltas[i].item()
-                    edge = "YES" if (target_node, i) in pred_edges_this else "NO "
                     mark = " ←" if i == target_node else ""
-                    print(f"  X{i}    | {td:6.4f} | {pd:6.4f} | {edge}{mark}")
+                    if show_gate:
+                        gp = gate_probs[target_node, i].item() if i != target_node else float("nan")
+                        in_gate = (predicted_edges is not None and (target_node, i) in predicted_edges)
+                        g_str = f"{gp:.3f} {'✓' if in_gate else ' '}" if i != target_node else "  self"
+                        print(f"  X{i}    | {td:6.4f} | {pd:6.4f} | {g_str}{mark}")
+                    else:
+                        in_gap = (target_node, i) in gap_edges_this
+                        print(f"  X{i}    | {td:6.4f} | {pd:6.4f} | {'YES' if in_gap else 'NO '}{mark}")
 
-        # Aggregate edges
-        predicted_edges = set()
-        for es in all_pred_edges.values():
-            predicted_edges.update(es)
-        predicted_edges = {(i, j) for i, j in predicted_edges if i != j}
+        # Final predicted edges: use gate if provided (train), else gap (infer)
+        if predicted_edges is None:
+            predicted_edges = set()
+            for es in gap_pred_edges.values():
+                predicted_edges.update(es)
+            predicted_edges = {(i, j) for i, j in predicted_edges if i != j}
 
         tp = true_edges & predicted_edges
         fp = predicted_edges - true_edges

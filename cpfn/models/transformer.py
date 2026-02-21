@@ -10,6 +10,7 @@ import torch.nn as nn
 from cpfn.models.embedding import ParallelUniverseEmbedding, InterventionQueryEncoder
 from cpfn.models.blocks import CrossUniverseBlock
 from cpfn.models.bar_distribution import BarDistribution
+from cpfn.models.causal_gate import CausalGate
 
 
 class MultiverseTransformer(nn.Module):
@@ -45,7 +46,7 @@ class MultiverseTransformer(nn.Module):
         self.embedding       = ParallelUniverseEmbedding(n_features, embed_dim)
         self.query_encoder   = InterventionQueryEncoder(n_features, embed_dim)
 
-        # --- Encoder: observational universe (the "base world") ---
+        # --- Encoder: observational universe ---
         self.obs_encoder = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
                 d_model=embed_dim,
@@ -62,8 +63,15 @@ class MultiverseTransformer(nn.Module):
             for _ in range(n_decoder_layers)
         ])
 
-        # --- Output: bar-distribution (full predictive distribution) ---
+        # --- Output: bar-distribution ---
         self.bar_head = BarDistribution(embed_dim, n_bins=n_bins)
+
+        # --- Causal Gate: learned K×K edge mask (Gumbel-Sigmoid) ---
+        self.causal_gate = CausalGate(
+            n_features=n_features,
+            temperature=2.0,       # will be annealed during training
+            sparsity_prior=-1.0,   # initialise biased toward sparse graph
+        )
 
     # ------------------------------------------------------------------ #
     #  Training forward pass — full multiverse                            #
@@ -99,9 +107,20 @@ class MultiverseTransformer(nn.Module):
         for layer in self.int_decoder:
             u_int = layer(obs_repeated, u_int)      # [K, s*f, embed_dim]
 
-        # Bar-distribution logits
-        logits = self.bar_head(u_int)               # [K, s*f, n_bins]
-        return logits
+        # Bar-distribution logits: [K, s*f, n_bins]
+        logits = self.bar_head(u_int)
+
+        # Apply Gumbel-Sigmoid causal gate to predicted means
+        # gate: [K, K] — gate[i, j] = prob that X_i → X_j exists
+        # We gate the mean prediction for each (intervention i, variable j) pair
+        gate = self.causal_gate(hard=False)         # [K, K] soft mask
+        means = self.bar_head.mean(logits)          # [K, s*f]
+        means_2d = means.view(f, s, f)              # [K, s, f] = [interv, samples, var]
+        # gate[i, j]: intervening on i → variable j is causal
+        # broadcast gate over the samples dimension
+        gated_means = means_2d * gate.unsqueeze(1)  # [K, s, f]
+
+        return logits, gated_means, gate
 
     # ------------------------------------------------------------------ #
     #  Inference forward pass — obs data + query token                    #

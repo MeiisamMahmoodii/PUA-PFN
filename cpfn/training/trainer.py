@@ -131,23 +131,26 @@ class Trainer:
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         self.model.train()
 
+        # Anneal Gumbel-Sigmoid temperature: 2.0 → 0.3 over training
+        self.model.causal_gate.anneal_temperature(
+            epoch, start_temp=2.0, end_temp=0.3, n_epochs=1500
+        )
+
         # ── Generate diverse SCM ────────────────────────────────────── #
         m_data, _ = generate_full_multiverse(
             self.n_samples,
             self.n_features,
-            randomise_prior=True,          # rich prior — all hyperparams randomised
+            randomise_prior=True,
             device=self.device,
         )
 
         # ── Targets ─────────────────────────────────────────────────── #
-        # Ground truth interventional universes: [K, n_samples, n_features]
-        targets = m_data[1:]                  # [K, s, f]
+        targets      = m_data[1:]   # [K, s, f]
         targets_flat = targets.reshape(self.n_features, self.n_samples * self.n_features)
-        # Note: bar-dist borders are fixed globally (set in __init__); no per-batch update.
 
         # ── Forward ─────────────────────────────────────────────────── #
         self.optimizer.zero_grad()
-        logits = self.model(m_data)           # [K, s*f, n_bins]
+        logits, gated_means, gate = self.model(m_data)  # now returns tuple
 
         # ── NLL loss ─────────────────────────────────────────────────── #
         nll = self.model.bar_head.nll_loss(
@@ -155,19 +158,22 @@ class Trainer:
             targets_flat.reshape(-1),
         )
 
-        # ── Sparsity loss ────────────────────────────────────────────── #
-        pred_means = self.model.bar_head.mean(logits)                # [K, s*f]
-        pred_means = pred_means.view(self.n_features, self.n_samples, self.n_features)
-        obs_world  = m_data[0]                                        # [s, f]
-        sp_loss = sparsity_loss(pred_means, obs_world, targets)
+        # ── Gate sparsity loss (Gumbel-Sigmoid version) ──────────────── #
+        # Encourage sparse graph: target ~30% edge density
+        gate_sp = self.model.causal_gate.sparsity_loss(target_density=0.3)
+
+        # ── Output sparsity loss (ensure non-descendants → 0 delta) ─── #
+        obs_world = m_data[0]  # [s, f]
+        sp_loss = sparsity_loss(gated_means, obs_world, targets)
 
         # ── Total loss ───────────────────────────────────────────────── #
-        loss = nll + self.lambda_sparsity * sp_loss
+        loss = nll + self.lambda_sparsity * sp_loss + 0.1 * gate_sp
 
-        # ── NaN guard — skip bad batches, don't corrupt model state ──── #
+        # ── NaN guard ────────────────────────────────────────────────── #
         if not torch.isfinite(loss):
             self.optimizer.zero_grad()
-            return {"loss": float("nan"), "nll": float("nan"), "sparsity": float("nan")}
+            return {"loss": float("nan"), "nll": float("nan"), "sparsity": float("nan"),
+                    "gate_density": float("nan")}
 
         # ── Backward ─────────────────────────────────────────────────── #
         loss.backward()
@@ -186,10 +192,12 @@ class Trainer:
 
         self.scheduler.step()
 
+        gate_density = gate.detach().mean().item()
         return {
-            "loss":     loss.item(),
-            "nll":      nll.item(),
-            "sparsity": sp_loss.item(),
+            "loss":         loss.item(),
+            "nll":          nll.item(),
+            "sparsity":     sp_loss.item(),
+            "gate_density": gate_density,
         }
 
     # ------------------------------------------------------------------ #
