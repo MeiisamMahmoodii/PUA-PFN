@@ -1,14 +1,19 @@
 """
-Training loop for C-PFN with full tracking and checkpointing
+Training loop for PUA-PFN (Parallel Universe PFN).
+
+Key changes from original C-PFN trainer:
+- NLL loss on bar-distribution (replaces MSE)
+- Sparsity loss: penalises non-zero predictions for non-descendants
+- Rich SCM prior via randomise_prior=True in generate_full_multiverse
+- Evaluates both train-mode and infer-mode F1
 """
 
 import torch
-import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 from pathlib import Path
 import json
-from typing import Dict, Tuple, Optional
+from typing import Dict, Optional
 from tqdm import tqdm
 
 from cpfn.models import MultiverseTransformer
@@ -16,16 +21,51 @@ from cpfn.data import generate_full_multiverse
 from cpfn.evaluation import CausalDiscoveryEvaluator
 
 
+# ──────────────────────────────────────────────── #
+#  Losses                                          #
+# ──────────────────────────────────────────────── #
+
+def sparsity_loss(
+    pred_means: torch.Tensor,
+    obs_means:  torch.Tensor,
+    true_targets: torch.Tensor,
+    threshold: float = 0.3,
+) -> torch.Tensor:
+    """
+    Push model predictions towards zero for non-causal (non-descendant) variables.
+
+    For each variable whose true interventional value is close to the
+    observational value (i.e., no causal effect), penalise the model
+    for predicting a large deviation from the observational baseline.
+
+    Args:
+        pred_means:   [K, s, f]  model's mean predictions per universe
+        obs_means:    [s, f]     observational means (broadcast over K)
+        true_targets: [K, s, f]  ground-truth interventional values
+        threshold:    if |true_delta| < threshold → treat as zero-effect
+
+    Returns:
+        scalar sparsity penalty
+    """
+    true_deltas = (true_targets - obs_means.unsqueeze(0)).abs()  # [K, s, f]
+    pred_deltas = (pred_means   - obs_means.unsqueeze(0)).abs()  # [K, s, f]
+
+    non_causal_mask = true_deltas < threshold
+    penalty = pred_deltas[non_causal_mask].pow(2).mean()
+    return penalty
+
+
+# ──────────────────────────────────────────────── #
+#  Trainer                                         #
+# ──────────────────────────────────────────────── #
+
 class Trainer:
     """
-    Trainer for Causal Prior Function Network (C-PFN).
+    Trainer for PUA-PFN (Parallel Universe PFN).
 
-    Features:
-    - Meta-learning with diverse SCMs
-    - Tensorboard logging
-    - Checkpoint saving
-    - Learning rate scheduling
-    - Variable do_val randomization
+    Training objectives:
+    1. NLL loss — bar-distribution over interventional outcomes
+    2. Sparsity loss — suppress predictions for non-descendants
     """
 
     def __init__(
@@ -38,124 +78,136 @@ class Trainer:
         log_dir: str = "logs",
         checkpoint_dir: str = "checkpoints",
         weight_decay: float = 1e-4,
+        lambda_sparsity: float = 0.05,
     ):
-        self.model = model.to(device)
-        self.n_features = n_features
-        self.n_samples = n_samples
-        self.device = device
-        
-        # Disable CUDA graph capture to avoid kernel errors
-        if device == 'cuda':
-            torch.cuda.is_available()  # Ensure CUDA is initialized
+        self.model           = model.to(device)
+        self.n_features      = n_features
+        self.n_samples       = n_samples
+        self.device          = device
+        self.lambda_sparsity = lambda_sparsity
 
-        self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate, weight_decay=weight_decay, foreach=False)
-        self.criterion = nn.MSELoss()
+        self.optimizer = optim.Adam(
+            self.model.parameters(),
+            lr=learning_rate,
+            weight_decay=weight_decay,
+            foreach=False,
+        )
         self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
             self.optimizer, T_0=50, T_mult=2
         )
 
+        # Fix bar-distribution borders once (stable NLL scale across all batches).
+        # Range [-30, 30] covers: do_val in [2,15] + mechanism amplification + obs noise.
+        self.model.bar_head.init_fixed_borders(
+            y_min=-30.0, y_max=30.0, device=torch.device(device)
+        )
+
         # Logging
-        self.log_dir = Path(log_dir)
+        self.log_dir        = Path(log_dir)
         self.checkpoint_dir = Path(checkpoint_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.writer  = SummaryWriter(str(self.log_dir))
+        self.history = {"epoch": [], "loss": [], "nll": [], "sparsity": [], "lr": [], "val_f1": []}
 
-        self.writer = SummaryWriter(str(self.log_dir))
-        self.history = {"epoch": [], "loss": [], "lr": [], "val_f1": []}
-        
         # Early stopping
-        self.best_f1 = 0.0
-        self.best_epoch = 0
-        self.patience = 0
-        self.max_patience = 200  # Stop if no improvement for 200 epochs
-        self.evaluator = None
+        self.best_f1      = 0.0
+        self.best_epoch   = 0
+        self.patience     = 0
+        self.max_patience = 200
+        self.evaluator    = None
 
-    def train_epoch(self, epoch: int) -> float:
-        """
-        Single training epoch: generate new SCMs, compute loss, update weights.
-        """
+    # ------------------------------------------------------------------ #
+    #  Single epoch                                                        #
+    # ------------------------------------------------------------------ #
+
+    def train_epoch(self, epoch: int) -> Dict[str, float]:
         self.model.train()
-        epoch_loss = 0.0
 
-        # Meta-learning: generate diverse SCMs
-        do_val = torch.rand(1).item() * 13.0 + 2.0  # Uniform [2, 15]
-
+        # ── Generate diverse SCM ────────────────────────────────────── #
         m_data, _ = generate_full_multiverse(
             self.n_samples,
             self.n_features,
-            do_val=do_val,
+            randomise_prior=True,          # rich prior — all hyperparams randomised
             device=self.device,
         )
 
-        # Ground truth: interventional universes
-        target = m_data[1:].reshape(
-            self.n_features, self.n_samples * self.n_features, 1
+        # ── Targets ─────────────────────────────────────────────────── #
+        # Ground truth interventional universes: [K, n_samples, n_features]
+        targets = m_data[1:]                  # [K, s, f]
+        targets_flat = targets.reshape(self.n_features, self.n_samples * self.n_features)
+        # Note: bar-dist borders are fixed globally (set in __init__); no per-batch update.
+
+        # ── Forward ─────────────────────────────────────────────────── #
+        self.optimizer.zero_grad()
+        logits = self.model(m_data)           # [K, s*f, n_bins]
+
+        # ── NLL loss ─────────────────────────────────────────────────── #
+        nll = self.model.bar_head.nll_loss(
+            logits.reshape(self.n_features * self.n_samples * self.n_features, -1),
+            targets_flat.reshape(-1),
         )
 
-        # Forward
-        self.optimizer.zero_grad()
-        predictions = self.model(m_data)
-        loss = self.criterion(predictions, target)
+        # ── Sparsity loss ────────────────────────────────────────────── #
+        pred_means = self.model.bar_head.mean(logits)                # [K, s*f]
+        pred_means = pred_means.view(self.n_features, self.n_samples, self.n_features)
+        obs_world  = m_data[0]                                        # [s, f]
+        sp_loss = sparsity_loss(pred_means, obs_world, targets)
 
-        # Backward
+        # ── Total loss ───────────────────────────────────────────────── #
+        loss = nll + self.lambda_sparsity * sp_loss
+
+        # ── Backward ─────────────────────────────────────────────────── #
         loss.backward()
-        # Clip gradients (but handle CUDA errors gracefully on GPU)
         try:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         except RuntimeError as e:
-            if "CUDA" in str(e):
-                # Skip gradient clipping on CUDA errors
-                pass
-            else:
+            if "CUDA" not in str(e):
                 raise
-        
         try:
             self.optimizer.step()
         except RuntimeError as e:
             if "CUDA" in str(e):
-                # Log but continue on CUDA errors in optimizer step
                 print(f"Warning: CUDA error in optimizer.step(): {e}")
             else:
                 raise
-        
+
         self.scheduler.step()
 
-        return loss.item()
+        return {
+            "loss":     loss.item(),
+            "nll":      nll.item(),
+            "sparsity": sp_loss.item(),
+        }
+
+    # ------------------------------------------------------------------ #
+    #  Validation                                                          #
+    # ------------------------------------------------------------------ #
 
     def validate(self, n_eval_samples: int = 15) -> float:
-        """
-        Validate model on causal discovery task.
-        Returns F1 score.
-        Uses smaller n_eval_samples to reduce memory usage with frequent validation.
-        """
-        # Ensure model is in eval mode and no gradients are tracked
         self.model.eval()
-        
         if self.evaluator is None:
             self.evaluator = CausalDiscoveryEvaluator(self.model, device=self.device)
-        
-        # Run evaluation without gradients
+
         with torch.no_grad():
             metrics = self.evaluator.evaluate(
-                n_samples=n_eval_samples,  # Reduced from 20 to 15
+                n_samples=n_eval_samples,
                 n_features=self.n_features,
                 do_val=10.0,
-                verbose=False
+                verbose=False,
+                mode="train",
             )
-        
-        f1_score = metrics['f1']
-        
-        # Return to training mode
+
+        f1 = metrics["f1"]
         self.model.train()
-        
-        # Reset evaluator to force garbage collection
         self.evaluator = None
-        
-        # Clear CUDA cache to prevent memory buildup
-        if self.device == 'cuda':
+        if self.device == "cuda":
             torch.cuda.empty_cache()
-        
-        return f1_score
+        return f1
+
+    # ------------------------------------------------------------------ #
+    #  Full training loop                                                  #
+    # ------------------------------------------------------------------ #
 
     def train(
         self,
@@ -165,97 +217,89 @@ class Trainer:
         val_interval: int = 100,
         early_stopping: bool = True,
     ) -> Dict:
-        """
-        Full training loop with early stopping.
-        
-        Args:
-            num_epochs: Maximum number of epochs
-            log_interval: Log loss every N epochs
-            checkpoint_interval: Save checkpoint every N epochs
-            val_interval: Validate every N epochs
-            early_stopping: Stop if F1 doesn't improve for max_patience epochs
-        """
-        print(f"Starting training for {num_epochs} epochs on {self.device}")
+        print(f"Starting PUA-PFN training for {num_epochs} epochs on {self.device}")
         print(f"n_features={self.n_features}, n_samples={self.n_samples}")
-        print(f"Early stopping enabled: {early_stopping} (patience={self.max_patience})")
+        print(f"lambda_sparsity={self.lambda_sparsity}, early_stopping={early_stopping}")
 
         pbar = tqdm(range(num_epochs), desc="Training")
         for epoch in pbar:
-            loss = self.train_epoch(epoch)
+            stats = self.train_epoch(epoch)
+            loss, nll, sp = stats["loss"], stats["nll"], stats["sparsity"]
+
             self.history["epoch"].append(epoch)
             self.history["loss"].append(loss)
+            self.history["nll"].append(nll)
+            self.history["sparsity"].append(sp)
             self.history["lr"].append(self.optimizer.param_groups[0]["lr"])
 
-            # Logging
             if (epoch + 1) % log_interval == 0:
-                pbar.set_postfix({"loss": f"{loss:.6f}"})
-                self.writer.add_scalar("train/loss", loss, epoch)
-                self.writer.add_scalar(
-                    "train/lr", self.optimizer.param_groups[0]["lr"], epoch
-                )
+                pbar.set_postfix({"NLL": f"{nll:.4f}", "sp": f"{sp:.4f}"})
+                self.writer.add_scalar("train/loss",     loss, epoch)
+                self.writer.add_scalar("train/nll",      nll,  epoch)
+                self.writer.add_scalar("train/sparsity", sp,   epoch)
+                self.writer.add_scalar("train/lr", self.optimizer.param_groups[0]["lr"], epoch)
 
-            # Validation with early stopping
             if early_stopping and (epoch + 1) % val_interval == 0:
                 val_f1 = self.validate()
                 self.history["val_f1"].append(val_f1)
                 self.writer.add_scalar("val/f1", val_f1, epoch)
-                
-                # Check for improvement
+
                 if val_f1 > self.best_f1:
-                    self.best_f1 = val_f1
+                    self.best_f1    = val_f1
                     self.best_epoch = epoch
-                    self.patience = 0
-                    # Save best model
+                    self.patience   = 0
                     self.save_checkpoint(epoch, is_best=True)
                     pbar.write(f"Epoch {epoch+1}: New best F1={val_f1:.4f}")
                 else:
                     self.patience += 1
                     if self.patience % 50 == 0:
-                        pbar.write(f"Epoch {epoch+1}: No improvement for {self.patience} evals ({self.patience*val_interval} epochs), best F1={self.best_f1:.4f}")
-                    
-                    # Early stopping
+                        pbar.write(
+                            f"Epoch {epoch+1}: No improvement for "
+                            f"{self.patience} evals, best F1={self.best_f1:.4f}"
+                        )
                     if self.patience >= self.max_patience:
                         pbar.write(f"\nEarly stopping at epoch {epoch+1}!")
-                        pbar.write(f"Best F1: {self.best_f1:.4f} at epoch {self.best_epoch+1}")
                         break
 
-            # Regular checkpoint
-            if (epoch + 1) % checkpoint_interval == 0 and (not early_stopping or not ((epoch + 1) % val_interval == 0)):
-                self.save_checkpoint(epoch)
+            if (epoch + 1) % checkpoint_interval == 0:
+                if not (early_stopping and (epoch + 1) % val_interval == 0):
+                    self.save_checkpoint(epoch)
 
         self.writer.close()
         self.save_history()
         return self.history
 
+    # ------------------------------------------------------------------ #
+    #  Checkpointing                                                       #
+    # ------------------------------------------------------------------ #
+
     def save_checkpoint(self, epoch: int, is_best: bool = False):
-        """Save model and optimizer state."""
         checkpoint = {
-            "epoch": epoch,
-            "model_state": self.model.state_dict(),
+            "epoch":           epoch,
+            "model_state":     self.model.state_dict(),
             "optimizer_state": self.optimizer.state_dict(),
             "scheduler_state": self.scheduler.state_dict(),
-            "history": self.history,
-            "best_f1": self.best_f1,
-            "best_epoch": self.best_epoch,
+            "history":         self.history,
+            "best_f1":         self.best_f1,
+            "best_epoch":      self.best_epoch,
         }
-        if is_best:
-            path = self.checkpoint_dir / "best_model.pt"
-        else:
-            path = self.checkpoint_dir / f"checkpoint_epoch_{epoch}.pt"
+        path = (
+            self.checkpoint_dir / "best_model.pt"
+            if is_best
+            else self.checkpoint_dir / f"checkpoint_epoch_{epoch}.pt"
+        )
         torch.save(checkpoint, path)
         print(f"Checkpoint saved: {path}")
 
     def load_checkpoint(self, path: str):
-        """Load from checkpoint."""
-        checkpoint = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(checkpoint["model_state"])
-        self.optimizer.load_state_dict(checkpoint["optimizer_state"])
-        self.scheduler.load_state_dict(checkpoint["scheduler_state"])
-        self.history = checkpoint["history"]
+        ckpt = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(ckpt["model_state"])
+        self.optimizer.load_state_dict(ckpt["optimizer_state"])
+        self.scheduler.load_state_dict(ckpt["scheduler_state"])
+        self.history = ckpt["history"]
         print(f"Loaded checkpoint: {path}")
 
     def save_history(self):
-        """Save training history."""
         path = self.log_dir / "history.json"
         with open(path, "w") as f:
             json.dump(self.history, f, indent=2)
