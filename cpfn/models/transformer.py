@@ -151,15 +151,28 @@ class MultiverseTransformer(nn.Module):
         obs_emb = self.embedding.embed_obs(obs_data)        # [1, s*f, embed_dim]
         obs_ctx = self.obs_encoder(obs_emb)                 # [1, s*f, embed_dim]
 
-        # Build intervention query tokens (no real int data needed)
+        # Query encoding: which variable, what do-value
         q_tokens = self.query_encoder(target_var, do_val, s, device)  # [1, s*f, embed_dim]
 
-        # Cross-universe decoder: query tokens attend to observational context
-        u_int = q_tokens
-        for layer in self.int_decoder:
-            u_int = layer(obs_ctx, u_int)               # [1, s*f, embed_dim]
+        # KEY FIX: inject query as additive bias on obs_ctx (keys/values of cross-attn).
+        # Previously q_tokens was used as u_int (query side), which got washed out
+        # after 4 layers cross-attending to 150 obs tokens → query signal ≈ 0.
+        # Now: biased_ctx = obs_ctx + query_identity is permanently visible at every
+        # decoder layer through the keys/values — target_var can never be drowned out.
+        biased_ctx = obs_ctx + q_tokens                     # [1, s*f, embed_dim]
 
-        logits    = self.bar_head(u_int.squeeze(0))     # [s*f, n_bins]
-        mean_pred = self.bar_head.mean(logits).view(s, f)  # [s, f]
+        # u_int starts from obs embeddings (matches training distribution)
+        u_int = obs_emb                                     # [1, s*f, embed_dim]
+
+        # Cross-universe decoder: u_int attends to query-biased obs context
+        for layer in self.int_decoder:
+            u_int = layer(biased_ctx, u_int)               # [1, s*f, embed_dim]
+
+        # Residual skip: add q_tokens to decoder output before bar_head.
+        # Guarantees target_var identity is present even if decoder layers attenuate it.
+        u_int = u_int + q_tokens                           # [1, s*f, embed_dim]
+
+        logits    = self.bar_head(u_int.squeeze(0))         # [s*f, n_bins]
+        mean_pred = self.bar_head.mean(logits).view(s, f)   # [s, f]
 
         return logits, mean_pred
