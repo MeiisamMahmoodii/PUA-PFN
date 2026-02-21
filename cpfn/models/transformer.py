@@ -66,11 +66,13 @@ class MultiverseTransformer(nn.Module):
         # --- Output: bar-distribution ---
         self.bar_head = BarDistribution(embed_dim, n_bins=n_bins)
 
-        # --- Causal Gate: learned K×K edge mask (Gumbel-Sigmoid) ---
+        # --- Causal Gate: data-conditioned K×K edge mask (Gumbel-Sigmoid) ---
+        # Takes encoder obs_context as input — predicts different graph per SCM
         self.causal_gate = CausalGate(
             n_features=n_features,
-            temperature=2.0,       # will be annealed during training
-            sparsity_prior=-1.0,   # initialise biased toward sparse graph
+            embed_dim=embed_dim,
+            hidden_dim=64,
+            temperature=2.0,
         )
 
     # ------------------------------------------------------------------ #
@@ -110,17 +112,14 @@ class MultiverseTransformer(nn.Module):
         # Bar-distribution logits: [K, s*f, n_bins]
         logits = self.bar_head(u_int)
 
-        # Apply Gumbel-Sigmoid causal gate to predicted means
-        # gate: [K, K] — gate[i, j] = prob that X_i → X_j exists
-        # We gate the mean prediction for each (intervention i, variable j) pair
-        gate = self.causal_gate(hard=False)         # [K, K] soft mask
-        means = self.bar_head.mean(logits)          # [K, s*f]
-        means_2d = means.view(f, s, f)              # [K, s, f] = [interv, samples, var]
-        # gate[i, j]: intervening on i → variable j is causal
-        # broadcast gate over the samples dimension
-        gated_means = means_2d * gate.unsqueeze(1)  # [K, s, f]
+        # Apply data-conditioned Gumbel-Sigmoid gate
+        # gate[i, j] = P(X_i → X_j) given these observations
+        gate     = self.causal_gate(obs_ctx, hard=False)    # [K, K]
+        means    = self.bar_head.mean(logits)               # [K, s*f]
+        means_2d = means.view(f, s, f)                      # [K, s, f]
+        gated_means = means_2d * gate.unsqueeze(1)          # [K, s, f]
 
-        return logits, gated_means, gate
+        return logits, gated_means, gate, obs_ctx
 
     # ------------------------------------------------------------------ #
     #  Inference forward pass — obs data + query token                    #

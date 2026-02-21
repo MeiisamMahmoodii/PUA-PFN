@@ -137,7 +137,7 @@ class Trainer:
         )
 
         # ── Generate diverse SCM ────────────────────────────────────── #
-        m_data, _ = generate_full_multiverse(
+        m_data, adj = generate_full_multiverse(
             self.n_samples,
             self.n_features,
             randomise_prior=True,
@@ -150,7 +150,7 @@ class Trainer:
 
         # ── Forward ─────────────────────────────────────────────────── #
         self.optimizer.zero_grad()
-        logits, gated_means, gate = self.model(m_data)  # now returns tuple
+        logits, gated_means, gate, obs_ctx = self.model(m_data)   # 4-tuple
 
         # ── NLL loss ─────────────────────────────────────────────────── #
         nll = self.model.bar_head.nll_loss(
@@ -158,22 +158,26 @@ class Trainer:
             targets_flat.reshape(-1),
         )
 
-        # ── Gate sparsity loss (Gumbel-Sigmoid version) ──────────────── #
-        # Encourage sparse graph: target ~30% edge density
-        gate_sp = self.model.causal_gate.sparsity_loss(target_density=0.3)
+        # ── Gate BCE loss: directly supervise gate with true adjacency ─ #
+        # We have adj from the synthetic SCM — this is the key signal for the gate
+        gate_bce = self.model.causal_gate.bce_loss(obs_ctx, adj)
 
-        # ── Output sparsity loss (ensure non-descendants → 0 delta) ─── #
-        obs_world = m_data[0]  # [s, f]
+        # ── Gate sparsity: prevent gate from predicting all-ones ──────── #
+        gate_sp = self.model.causal_gate.sparsity_loss(obs_ctx, target_density=0.3)
+
+        # ── Output sparsity loss ─────────────────────────────────────── #
+        obs_world = m_data[0]
         sp_loss = sparsity_loss(gated_means, obs_world, targets)
 
         # ── Total loss ───────────────────────────────────────────────── #
-        loss = nll + self.lambda_sparsity * sp_loss + 0.1 * gate_sp
+        # BCE weight 1.0 — direct adjacency supervision is the primary gate signal
+        loss = nll + self.lambda_sparsity * sp_loss + gate_bce + 0.05 * gate_sp
 
         # ── NaN guard ────────────────────────────────────────────────── #
         if not torch.isfinite(loss):
             self.optimizer.zero_grad()
             return {"loss": float("nan"), "nll": float("nan"), "sparsity": float("nan"),
-                    "gate_density": float("nan")}
+                    "gate_bce": float("nan"), "gate_density": float("nan")}
 
         # ── Backward ─────────────────────────────────────────────────── #
         loss.backward()
@@ -197,6 +201,7 @@ class Trainer:
             "loss":         loss.item(),
             "nll":          nll.item(),
             "sparsity":     sp_loss.item(),
+            "gate_bce":     gate_bce.item(),
             "gate_density": gate_density,
         }
 
@@ -210,12 +215,14 @@ class Trainer:
             self.evaluator = CausalDiscoveryEvaluator(self.model, device=self.device)
 
         with torch.no_grad():
+            # Use infer mode: obs data + query token + gap threshold
+            # This works regardless of gate training progress
             metrics = self.evaluator.evaluate(
                 n_samples=n_eval_samples,
                 n_features=self.n_features,
                 do_val=10.0,
                 verbose=False,
-                mode="train",
+                mode="infer",
             )
 
         f1 = metrics["f1"]

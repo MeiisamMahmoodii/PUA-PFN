@@ -75,10 +75,10 @@ class CausalDiscoveryEvaluator:
         )
 
         with torch.no_grad():
-            logits, gated_means, gate = self.model(m_true)   # tuple
+            logits, gated_means, gate, obs_ctx = self.model(m_true)   # 4-tuple
 
-        # Edge prediction: use learned Gumbel-Sigmoid gate (principled, no threshold heuristic)
-        pred_adj = self.model.causal_gate.hard_adjacency()   # [K, K] binary
+        # Edge prediction: use data-conditioned gate (principled, learned)
+        pred_adj = self.model.causal_gate.hard_adjacency(obs_ctx)     # [K, K]
         predicted_edges = {
             (i, j)
             for i in range(n_features)
@@ -88,7 +88,8 @@ class CausalDiscoveryEvaluator:
 
         return self._compute_metrics(
             logits, m_true, adj, n_samples, n_features, verbose,
-            mode="train", predicted_edges=predicted_edges
+            mode="train", predicted_edges=predicted_edges,
+            obs_ctx=obs_ctx
         )
 
     # ------------------------------------------------------------------ #
@@ -132,7 +133,7 @@ class CausalDiscoveryEvaluator:
 
     def _compute_metrics(
         self, logits, m_true, adj, n_samples, n_features, verbose, mode,
-        predicted_edges=None  # if provided (train mode), skip gap-threshold computation
+        predicted_edges=None, obs_ctx=None
     ) -> Dict:
         true_edges = set()
         edges = torch.where(adj > 0)
@@ -183,9 +184,12 @@ class CausalDiscoveryEvaluator:
             gap_pred_edges[target_node] = gap_edges_this
 
             if verbose:
-                # In train mode, show gate probs alongside
-                show_gate = (mode == "train" and hasattr(self.model, "causal_gate"))
-                gate_probs = self.model.causal_gate.edge_probs().detach() if show_gate else None
+                show_gate = (mode == "train" and obs_ctx is not None
+                             and hasattr(self.model, "causal_gate"))
+                gate_probs = (
+                    self.model.causal_gate.edge_probs(obs_ctx).detach()
+                    if show_gate else None
+                )
 
                 print(f"\n--- Intervention on X{target_node} ---")
                 header = "Variable | True Δ | Pred Δ | Gate P" if show_gate else "Variable | True Δ | Pred Δ"
