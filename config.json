@@ -18,5 +18,5 @@
   "checkpoint_interval": 500,
   "log_dir": "logs",
   "checkpoint_dir": "checkpoints",
-  "device": "cpu"
+  "device": "auto"
 }

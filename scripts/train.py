@@ -43,6 +43,9 @@ def main():
         config.learning_rate = args.learning_rate
         if args.device != "auto":
             config.device = args.device
+        # Always resolve "auto" to an actual device string
+        if config.device in ("auto", None):
+            config.device = get_device("auto")
     else:
         config = Config(
             num_epochs=args.num_epochs,
