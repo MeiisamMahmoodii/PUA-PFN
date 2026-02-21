@@ -92,7 +92,7 @@ class Trainer:
         self.n_samples       = n_samples
         self.device          = device
         self.lambda_sparsity = lambda_sparsity
-        self.lambda_infer    = 0.5   # weight for infer-mode NLL loss
+        self.lambda_infer    = 1.0   # equal weight with train NLL — forces query encoder to dominate
 
         self.optimizer = optim.Adam(
             self.model.parameters(),
