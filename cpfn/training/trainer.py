@@ -92,6 +92,7 @@ class Trainer:
         self.n_samples       = n_samples
         self.device          = device
         self.lambda_sparsity = lambda_sparsity
+        self.lambda_infer    = 0.5   # weight for infer-mode NLL loss
 
         self.optimizer = optim.Adam(
             self.model.parameters(),
@@ -170,16 +171,30 @@ class Trainer:
         obs_world = m_data[0]
         sp_loss = sparsity_loss(gated_means, obs_world, targets)
 
+        # ── Infer-mode NLL: train the obs-only pathway directly ──────── #
+        # Pick one random intervention variable k for this batch.
+        # Extract do_val from data: m_data[k+1, :, k] are all set to do_val exactly.
+        k_infer     = torch.randint(0, self.n_features, (1,)).item()
+        do_val_inf  = m_data[k_infer + 1, 0, k_infer].item()   # exact do_val used
+        obs_data    = m_data[0]                                  # [s, f] obs only
+        true_int_k  = m_data[k_infer + 1].reshape(-1)           # [s*f] true outcomes
+
+        logits_inf, _ = self.model.infer(obs_data, k_infer, do_val_inf)
+        nll_infer = self.model.bar_head.nll_loss(logits_inf, true_int_k)
+
         # ── Total loss ───────────────────────────────────────────────── #
-        # NLL is primary; gate_bce weight 0.2 — auxiliary graph supervision
-        # (was 1.0 before which overwhelmed NLL causing divergence after epoch 100)
-        loss = nll + self.lambda_sparsity * sp_loss + 0.2 * gate_bce + 0.05 * gate_sp
+        # NLL is primary; infer NLL trains obs-only pathway; BCE/sparsity are auxiliary
+        loss = (nll
+                + self.lambda_sparsity * sp_loss
+                + self.lambda_infer    * nll_infer
+                + 0.2 * gate_bce
+                + 0.05 * gate_sp)
 
         # ── NaN guard ────────────────────────────────────────────────── #
         if not torch.isfinite(loss):
             self.optimizer.zero_grad()
-            return {"loss": float("nan"), "nll": float("nan"), "sparsity": float("nan"),
-                    "gate_bce": float("nan"), "gate_density": float("nan")}
+            return {"loss": float("nan"), "nll": float("nan"), "nll_infer": float("nan"),
+                    "sparsity": float("nan"), "gate_bce": float("nan"), "gate_density": float("nan")}
 
         # ── Backward ─────────────────────────────────────────────────── #
         loss.backward()
@@ -202,6 +217,7 @@ class Trainer:
         return {
             "loss":         loss.item(),
             "nll":          nll.item(),
+            "nll_infer":    nll_infer.item(),
             "sparsity":     sp_loss.item(),
             "gate_bce":     gate_bce.item(),
             "gate_density": gate_density,
