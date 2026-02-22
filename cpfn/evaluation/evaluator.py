@@ -114,17 +114,32 @@ class CausalDiscoveryEvaluator:
             device=self.device,
         )
 
-        # Collect per-variable logits using inference mode
-        all_logits = []
         with torch.no_grad():
+            # Get obs_ctx for gate (no interventional data needed)
+            obs_emb = self.model.embedding.embed_obs(obs_data)  # [1, s*f, embed_dim]
+            obs_ctx = self.model.obs_encoder(obs_emb)           # [1, s*f, embed_dim]
+
+            # Edge detection: use gate conditioned on obs_ctx only
+            # Gate is trained with BCE supervision → correct for obs-only setting
+            pred_adj = self.model.causal_gate.hard_adjacency(obs_ctx)  # [K, K]
+            predicted_edges = {
+                (i, j)
+                for i in range(n_features)
+                for j in range(n_features)
+                if i != j and pred_adj[i, j].item() > 0.5
+            }
+
+            # Collect per-variable logits for NLL metric
+            all_logits = []
             for var_idx in range(n_features):
                 logits_var, _ = self.model.infer(obs_data, var_idx, do_val)
-                all_logits.append(logits_var.unsqueeze(0))  # [1, s*f, n_bins]
+                all_logits.append(logits_var.unsqueeze(0))
 
         logits = torch.cat(all_logits, dim=0)  # [K, s*f, n_bins]
 
         return self._compute_metrics(
-            logits, m_true, adj, n_samples, n_features, verbose, mode="infer"
+            logits, m_true, adj, n_samples, n_features, verbose,
+            mode="infer", predicted_edges=predicted_edges, obs_ctx=obs_ctx
         )
 
     # ------------------------------------------------------------------ #
