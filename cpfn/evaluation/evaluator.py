@@ -78,12 +78,13 @@ class CausalDiscoveryEvaluator:
             logits, gated_means, gate, obs_ctx = self.model(m_true)   # 4-tuple
 
         # Edge prediction: use data-conditioned gate (principled, learned)
+        # Restrict to upper-triangular (i<j) to match SCM convention: DAGs are triu only
         pred_adj = self.model.causal_gate.hard_adjacency(obs_ctx)     # [K, K]
         predicted_edges = {
             (i, j)
             for i in range(n_features)
             for j in range(n_features)
-            if i != j and pred_adj[i, j].item() > 0.5
+            if i < j and pred_adj[i, j].item() > 0.5
         }
 
         return self._compute_metrics(
@@ -126,7 +127,7 @@ class CausalDiscoveryEvaluator:
                 (i, j)
                 for i in range(n_features)
                 for j in range(n_features)
-                if i != j and pred_adj[i, j].item() > 0.5
+                if i < j and pred_adj[i, j].item() > 0.5
             }
 
             # Collect per-variable logits for NLL metric
@@ -228,7 +229,7 @@ class CausalDiscoveryEvaluator:
             predicted_edges = set()
             for es in gap_pred_edges.values():
                 predicted_edges.update(es)
-            predicted_edges = {(i, j) for i, j in predicted_edges if i != j}
+            predicted_edges = {(i, j) for i, j in predicted_edges if i < j}
 
         tp = true_edges & predicted_edges
         fp = predicted_edges - true_edges

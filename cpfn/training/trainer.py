@@ -260,7 +260,7 @@ class Trainer:
 
         f1_scores = []
         with torch.no_grad():
-            for _ in range(n_trials):
+            for trial in range(n_trials):
                 metrics = self.evaluator.evaluate(
                     n_samples=n_eval_samples,
                     n_features=self.n_features,
