@@ -7,7 +7,7 @@ adjacency matrices for different SCMs.
 
 Architecture:
   obs_context [1, s*f, embed_dim]
-      → pool → [embed_dim]
+      → pool (global mean or per-variable mean)
       → MLP  → [K*K] logits
       → reshape → [K, K] edge probabilities
 
@@ -20,6 +20,25 @@ Supervision: BCE against ground-truth adjacency (available at training since
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def _pool_obs_context(
+    obs_context: torch.Tensor,
+    n_features: int,
+    use_per_variable: bool,
+) -> torch.Tensor:
+    """
+    Pool obs_context [1, s*f, embed_dim] to a fixed-size vector.
+    - use_per_variable=False: global mean → [embed_dim]
+    - use_per_variable=True:  per-variable mean → [n_features, embed_dim] flattened
+    """
+    if not use_per_variable:
+        return obs_context.mean(dim=1).flatten()
+    # Reshape to [1, n_samples, n_features, embed_dim], mean over samples
+    s_f, edim = obs_context.shape[1], obs_context.shape[2]
+    s = s_f // n_features
+    ctx = obs_context.view(1, s, n_features, edim).mean(dim=1).flatten()
+    return ctx
 
 
 class CausalGate(nn.Module):
@@ -41,17 +60,21 @@ class CausalGate(nn.Module):
         self,
         n_features: int,
         embed_dim: int,
-        hidden_dim: int = 64,
+        hidden_dim: int = 128,
         temperature: float = 1.0,
+        use_per_variable_pooling: bool = True,
     ):
         super().__init__()
         self.n_features = n_features
         self.temperature = temperature
+        self.use_per_variable_pooling = use_per_variable_pooling
+
+        # Input dim: per-variable keeps structure (K*embed_dim), global collapses to embed_dim
+        ctx_dim = n_features * embed_dim if use_per_variable_pooling else embed_dim
 
         # MLP: obs_context_pooled → K×K edge logits
-        # Global Mean pooling: [embed_dim] → results
         self.edge_predictor = nn.Sequential(
-            nn.Linear(embed_dim, hidden_dim * 2),
+            nn.Linear(ctx_dim, hidden_dim * 2),
             nn.ReLU(),
             nn.Linear(hidden_dim * 2, hidden_dim * 2),
             nn.ReLU(),
@@ -76,8 +99,9 @@ class CausalGate(nn.Module):
         Returns:
             gate: [K, K]  soft (0,1) or hard {0,1} edge mask
         """
-        # Pool Global Mean: [1, s*f, embed_dim] → [embed_dim]
-        ctx = obs_context.mean(dim=1).flatten()   # [embed_dim]
+        ctx = _pool_obs_context(
+            obs_context, self.n_features, self.use_per_variable_pooling
+        )
 
         # Predict edge logits
         logits = self.edge_predictor(ctx).view(self.n_features, self.n_features)
@@ -103,7 +127,9 @@ class CausalGate(nn.Module):
         [K, K] edge probabilities (no noise) given obs_context.
         Use for evaluation and monitoring.
         """
-        ctx    = obs_context.mean(dim=1).flatten()
+        ctx = _pool_obs_context(
+            obs_context, self.n_features, self.use_per_variable_pooling
+        )
         logits = self.edge_predictor(ctx).view(self.n_features, self.n_features)
 
         probs  = torch.sigmoid(logits) * self.diag_mask
@@ -124,20 +150,18 @@ class CausalGate(nn.Module):
     ) -> torch.Tensor:
         """
         Binary cross-entropy loss against ground-truth adjacency.
-        This directly supervises the gate to predict the correct graph.
-
-        Args:
-            obs_context: [1, s*f, embed_dim]
-            true_adj:    [K, K] float (0/1)
+        Restricts to upper triangle (i<j) to match SCM convention and focus gradients.
         """
-        ctx    = obs_context.mean(dim=1).flatten()
+        ctx = _pool_obs_context(
+            obs_context, self.n_features, self.use_per_variable_pooling
+        )
         logits = self.edge_predictor(ctx).view(self.n_features, self.n_features)
 
-        # Only compute loss on off-diagonal entries
-        off_diag  = self.diag_mask.bool()
+        # Upper triangle only (i<j): matches SCM convention, fewer outputs
+        upper_tri = torch.triu(torch.ones_like(logits), diagonal=1).bool()
         return F.binary_cross_entropy_with_logits(
-            logits[off_diag],
-            true_adj[off_diag].float(),
+            logits[upper_tri],
+            true_adj[upper_tri].float(),
         )
 
     def sparsity_loss(self, obs_context: torch.Tensor, target_density: float = 0.1) -> torch.Tensor:

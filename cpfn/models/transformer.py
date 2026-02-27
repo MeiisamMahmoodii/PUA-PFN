@@ -71,8 +71,9 @@ class MultiverseTransformer(nn.Module):
         self.causal_gate = CausalGate(
             n_features=n_features,
             embed_dim=embed_dim,
-            hidden_dim=64,
+            hidden_dim=128,
             temperature=2.0,
+            use_per_variable_pooling=True,
         )
 
     # ------------------------------------------------------------------ #

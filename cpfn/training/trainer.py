@@ -87,13 +87,25 @@ class Trainer:
         checkpoint_dir: str = "checkpoints",
         weight_decay: float = 1e-4,
         lambda_sparsity: float = 0.05,
+        gate_warmup_epochs: int = 100,
     ):
-        self.model           = model.to(device)
-        self.n_features      = n_features
-        self.n_samples       = n_samples
-        self.device          = device
-        self.lambda_sparsity = lambda_sparsity
-        self.lambda_infer    = 1.0   # equal weight with train NLL — forces query encoder to dominate
+        self.model              = model.to(device)
+        self.n_features         = n_features
+        self.n_samples          = n_samples
+        self.device             = device
+        self.lambda_sparsity    = lambda_sparsity
+        self.lambda_infer       = 1.0   # equal weight with train NLL — forces query encoder to dominate
+        self.gate_warmup_epochs = gate_warmup_epochs
+
+        # Params for gate warm-up: gate + obs_encoder + embedding (obs path)
+        self._gate_params = (
+            list(model.causal_gate.parameters())
+            + list(model.obs_encoder.parameters())
+            + list(model.embedding.parameters())
+        )
+        self._other_params = [
+            p for p in model.parameters() if p not in set(self._gate_params)
+        ]
 
         self.optimizer = optim.Adam(
             self.model.parameters(),
@@ -138,6 +150,13 @@ class Trainer:
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         self.model.train()
 
+        # Gate warm-up: freeze other params, train only gate + obs path
+        in_warmup = epoch < self.gate_warmup_epochs
+        for p in self._other_params:
+            p.requires_grad = not in_warmup
+        for p in self._gate_params:
+            p.requires_grad = True
+
         # Anneal Gumbel-Sigmoid temperature: 2.0 → 0.1 over 500 epochs
         self.model.causal_gate.anneal_temperature(
             epoch, start_temp=2.0, end_temp=0.1, n_epochs=500
@@ -157,47 +176,48 @@ class Trainer:
 
         # ── Forward ─────────────────────────────────────────────────── #
         self.optimizer.zero_grad()
-        logits, gated_means, gate, obs_ctx = self.model(m_data)   # 4-tuple
 
-        # ── NLL loss ─────────────────────────────────────────────────── #
-        nll = self.model.bar_head.nll_loss(
-            logits.reshape(self.n_features * self.n_samples * self.n_features, -1),
-            targets_flat.reshape(-1),
-        )
+        if in_warmup:
+            # Warm-up: only gate losses, no full forward
+            obs_emb = self.model.embedding.embed_obs(m_data[0])
+            obs_ctx = self.model.obs_encoder(obs_emb)
+        else:
+            logits, gated_means, gate, obs_ctx = self.model(m_data)
 
-        # ── Gate BCE loss: directly supervise gate with true adjacency ─ #
-        # We have adj from the synthetic SCM — this is the key signal for the gate
+        # ── Gate losses (always) ─────────────────────────────────────── #
         gate_bce = self.model.causal_gate.bce_loss(obs_ctx, adj)
-
-        # ── Gate sparsity: prevent gate from predicting all-ones ──────── #
-        gate_sp = self.model.causal_gate.sparsity_loss(obs_ctx, target_density=0.15)
-
-        # ── Output sparsity loss ─────────────────────────────────────── #
-        obs_world = m_data[0]
-        sp_loss = sparsity_loss(gated_means, obs_world, targets)
-
-        # ── Infer-mode NLL: train the obs-only pathway directly ──────── #
-        # Pick one random intervention variable k for this batch.
-        # Extract do_val from data: m_data[k+1, :, k] are all set to do_val exactly.
-        k_infer     = torch.randint(0, self.n_features, (1,)).item()
-        do_val_inf  = m_data[k_infer + 1, 0, k_infer].item()   # exact do_val used
-        obs_data    = m_data[0]                                  # [s, f] obs only
-        true_int_k  = m_data[k_infer + 1].reshape(-1)           # [s*f] true outcomes
-
-        logits_inf, _ = self.model.infer(obs_data, k_infer, do_val_inf)
-        nll_infer = self.model.bar_head.nll_loss(logits_inf, true_int_k)
-
-        # ── Gate entropy: force decisions to be binary (0 or 1) ──────── #
+        gate_sp  = self.model.causal_gate.sparsity_loss(obs_ctx, target_density=0.15)
         gate_ent = self.model.causal_gate.entropy_loss(obs_ctx)
 
-        # ── Total loss ───────────────────────────────────────────────── #
-        # NLL is primary; infer NLL trains obs-only pathway; BCE/sparsity are auxiliary
-        loss = (nll
-                + 0.3 * sp_loss        # Doubled: push non-descendants harder to 0
+        if in_warmup:
+            loss = 2.5 * gate_bce + 0.2 * gate_sp + 0.15 * gate_ent
+            nll = torch.tensor(0.0, device=self.device)
+            nll_infer = torch.tensor(0.0, device=self.device)
+            sp_loss = torch.tensor(0.0, device=self.device)
+            gate = self.model.causal_gate(obs_ctx, hard=False)
+        else:
+            # ── NLL loss ────────────────────────────────────────────── #
+            nll = self.model.bar_head.nll_loss(
+                logits.reshape(self.n_features * self.n_samples * self.n_features, -1),
+                targets_flat.reshape(-1),
+            )
+            # ── Output sparsity loss ────────────────────────────────── #
+            obs_world = m_data[0]
+            sp_loss = sparsity_loss(gated_means, obs_world, targets)
+            # ── Infer-mode NLL ──────────────────────────────────────── #
+            k_infer     = torch.randint(0, self.n_features, (1,)).item()
+            do_val_inf  = m_data[k_infer + 1, 0, k_infer].item()
+            obs_data    = m_data[0]
+            true_int_k  = m_data[k_infer + 1].reshape(-1)
+            logits_inf, _ = self.model.infer(obs_data, k_infer, do_val_inf)
+            nll_infer = self.model.bar_head.nll_loss(logits_inf, true_int_k)
+            # ── Total loss ──────────────────────────────────────────── #
+            loss = (nll
+                + 0.3 * sp_loss
                 + self.lambda_infer    * nll_infer
-                + 1.0 * gate_bce       # Doubled: penalize incorrect edge logic more
-                + 0.2 * gate_sp        # Doubled: encourage lower edge density
-                + 0.15 * gate_ent)     # Increased: push harder for binary decisions
+                + 2.5 * gate_bce       # Stronger gate supervision
+                + 0.2 * gate_sp
+                + 0.15 * gate_ent)
 
         # ── NaN guard ────────────────────────────────────────────────── #
         if not torch.isfinite(loss):
@@ -292,6 +312,7 @@ class Trainer:
         print(f"Starting PUA-PFN training for {num_epochs} epochs on {self.device}")
         print(f"n_features={self.n_features}, n_samples={self.n_samples}")
         print(f"lambda_sparsity={self.lambda_sparsity}, early_stopping={early_stopping}")
+        print(f"gate_warmup_epochs={self.gate_warmup_epochs} (train gate+obs path only)")
 
         pbar = tqdm(range(num_epochs), desc="Training")
         for epoch in pbar:
