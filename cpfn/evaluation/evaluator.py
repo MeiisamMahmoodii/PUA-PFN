@@ -107,12 +107,12 @@ class CausalDiscoveryEvaluator:
         obs_data = m_true[0]  # [n_samples, n_features]
 
         # Set bar-distribution borders
-        targets_flat = m_true[1:].reshape(-1)
-        self.model.bar_head.set_borders(
-            targets_flat.min().item(),
-            targets_flat.max().item(),
-            device=self.device,
-        )
+        # targets_flat = m_true[1:].reshape(-1)
+        # self.model.bar_head.set_borders(
+        #     targets_flat.min().item(),
+        #     targets_flat.max().item(),
+        #     device=self.device,
+        # )
 
         with torch.no_grad():
             # Get obs_ctx for gate (no interventional data needed)

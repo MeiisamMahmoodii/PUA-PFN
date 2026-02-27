@@ -114,30 +114,39 @@ class InterventionQueryEncoder(nn.Module):
 
     def forward(
         self,
-        target_var: int,
-        do_val: float,
+        target_var: torch.Tensor, # [N] (int)
+        do_val: torch.Tensor,     # [N] (float)
         n_samples: int,
         device: torch.device,
     ) -> torch.Tensor:
         """
+        Args:
+            target_var: [N] tensor of target variable indices
+            do_val:     [N] tensor of intervention values
         Returns:
-            query_tokens: [1, n_samples*n_features, embed_dim]
-                          (matches the shape expected by CrossUniverseBlock)
+            query_tokens: [N, n_samples*n_features, embed_dim]
         """
-        # Build one-hot intervention specification
-        one_hot = torch.zeros(self.n_features + 1, device=device)
-        one_hot[target_var] = 1.0
-        one_hot[-1]         = do_val  # append scalar do_val
-
-        # Project to embed_dim, then repeat for all tokens
-        query_base = self.query_proj(one_hot)  # [embed_dim]
-
-        # Feature-level tokens: [n_features, embed_dim]
-        feat_idx    = torch.arange(self.n_features, device=device)
-        feat_tokens = query_base.unsqueeze(0) + self.feature_embed(feat_idx)
-
-        # Expand across n_samples dimension: [n_samples*n_features, embed_dim]
-        tokens = feat_tokens.unsqueeze(0).expand(n_samples, -1, -1)
-        tokens = tokens.reshape(n_samples * self.n_features, -1)
-
-        return tokens.unsqueeze(0)  # [1, n_samples*n_features, embed_dim]
+        N = target_var.shape[0]
+        
+        # Build batch of one-hot + do_val
+        # shape: [N, n_features + 1]
+        one_hot = torch.zeros(N, self.n_features + 1, device=device)
+        one_hot[torch.arange(N), target_var] = 1.0
+        one_hot[:, -1] = do_val
+        
+        # Project: [N, embed_dim]
+        query_base = self.query_proj(one_hot)
+        
+        # Feature embeddings: [n_features, embed_dim]
+        feat_idx = torch.arange(self.n_features, device=device)
+        f_embeds = self.feature_embed(feat_idx) # [f, embed_dim]
+        
+        # Combine: query_base [N, 1, embed_dim] + f_embeds [1, f, embed_dim]
+        # Result: [N, f, embed_dim]
+        feat_tokens = query_base.unsqueeze(1) + f_embeds.unsqueeze(0)
+        
+        # Expand across samples: [N, s, f, embed_dim]
+        tokens = feat_tokens.unsqueeze(1).expand(-1, n_samples, -1, -1)
+        tokens = tokens.reshape(N, n_samples * self.n_features, -1)
+        
+        return tokens # [N, s*f, embed_dim]

@@ -99,15 +99,39 @@ class MultiverseTransformer(nn.Module):
         # Encode observational universe
         obs_ctx = self.obs_encoder(embedded[0].unsqueeze(0))  # [1, s*f, embed_dim]
 
-        # Interventional universes
-        u_int = embedded[1:]                        # [K, s*f, embed_dim]
+        # Interventional universes: which variable, what do-value?
+        # Universe i intervenes on variable i-1.
+        # We need to extract the exact do_val used for each universe from m_data.
+        # m_data[1:] has shape [f, s, f]. 
+        # For universe i (index i into m_data[1:]), the do_val is at [i, 0, i].
+        # Using diagonal on a batch of matrices:
+        interv_data = m_data[1:, 0, :]               # [f, f]
+        do_vals     = torch.diagonal(interv_data)    # [f]
+        target_vars = torch.arange(f, device=m_data.device)
+        
+        # Build query tokens for all interventional universes simultaneously
+        q_tokens = self.query_encoder(target_vars, do_vals, s, m_data.device) # [f, s*f, embed_dim]
+
 
         # Replicate obs context for each interventional universe
         obs_repeated = obs_ctx.expand(u - 1, -1, -1)  # [K, s*f, embed_dim]
 
+        # KEY FIX: Non-autoregressive simulation.
+        # decoder input (u_int) starts from obs embeddings, NOT the target data.
+        # This prevents the model from "cheating" by seeing the answer.
+        u_int_input = embedded[0].unsqueeze(0).expand(f, -1, -1) # [K, s*f, embed_dim]
+        
+        # Inject query as additive bias (same as infer())
+        biased_ctx = obs_repeated + q_tokens         # [K, s*f, embed_dim]
+
         # Cross-universe decoder
+        u_int = u_int_input
         for layer in self.int_decoder:
-            u_int = layer(obs_repeated, u_int)      # [K, s*f, embed_dim]
+            u_int = layer(biased_ctx, u_int)         # [K, s*f, embed_dim]
+        
+        # Residual skip
+        u_int = u_int + q_tokens                     # [K, s*f, embed_dim]
+
 
         # Bar-distribution logits: [K, s*f, n_bins]
         logits = self.bar_head(u_int)
@@ -115,9 +139,22 @@ class MultiverseTransformer(nn.Module):
         # Apply data-conditioned Gumbel-Sigmoid gate
         # gate[i, j] = P(X_i → X_j) given these observations
         gate     = self.causal_gate(obs_ctx, hard=False)    # [K, K]
+        
+        # --- Delta Gating Logic ---
+        # 1. Observational baseline (from Universe 0)
+        u0_data = m_data[0]                                 # [s, f]
+        obs_means = u0_data.mean(dim=0)                    # [f]
+        
+        # 2. Raw predictions from decoder
         means    = self.bar_head.mean(logits)               # [K, s*f]
-        means_2d = means.view(f, s, f)                      # [K, s, f]
-        gated_means = means_2d * gate.unsqueeze(1)          # [K, s, f]
+        means_3d = means.view(f, s, f)                      # [K, s, f]
+        
+        # 3. Deviation from baseline (the intervention effect)
+        deltas = means_3d - obs_means.view(1, 1, f)         # [K, s, f]
+        
+        # 4. Gated response: Pred = Obs + Gate * Delta
+        # gate[i, j] matches Universe i (do(X_i)) predicting Variable j
+        gated_means = obs_means.view(1, 1, f) + gate.unsqueeze(1) * deltas # [K, s, f]
 
         return logits, gated_means, gate, obs_ctx
 
@@ -152,7 +189,10 @@ class MultiverseTransformer(nn.Module):
         obs_ctx = self.obs_encoder(obs_emb)                 # [1, s*f, embed_dim]
 
         # Query encoding: which variable, what do-value
-        q_tokens = self.query_encoder(target_var, do_val, s, device)  # [1, s*f, embed_dim]
+        target_ten = torch.tensor([target_var], device=device)
+        do_ten     = torch.tensor([do_val], device=device)
+        q_tokens   = self.query_encoder(target_ten, do_ten, s, device)  # [1, s*f, embed_dim]
+
 
         # KEY FIX: inject query as additive bias on obs_ctx (keys/values of cross-attn).
         # Previously q_tokens was used as u_int (query side), which got washed out
@@ -173,6 +213,21 @@ class MultiverseTransformer(nn.Module):
         u_int = u_int + q_tokens                           # [1, s*f, embed_dim]
 
         logits    = self.bar_head(u_int.squeeze(0))         # [s*f, n_bins]
-        mean_pred = self.bar_head.mean(logits).view(s, f)   # [s, f]
+        mean_raw  = self.bar_head.mean(logits).view(s, f)   # [s, f]
+
+        # --- Inference Delta Gating ---
+        # Predict gate for this specific intervention
+        gate_probs = self.causal_gate.edge_probs(obs_ctx)   # [K, K]
+        gate_row   = gate_probs[target_var]                 # [f]
+        
+        # KEY REFINEMENT: Use a hard threshold for inference gating.
+        # This prevents "leakage" from tiny residual probabilities from muddying the pred.
+        hard_gate = (gate_row > 0.35).float()
+        
+        obs_means  = obs_data.mean(dim=0)                   # [f]
+        deltas     = mean_raw - obs_means.view(1, f)        # [s, f]
+        
+        # mean_pred[j] exactly follows obs_means[j] if hard_gate[j] is 0.
+        mean_pred = obs_means.view(1, f) + hard_gate.view(1, f) * deltas
 
         return logits, mean_pred

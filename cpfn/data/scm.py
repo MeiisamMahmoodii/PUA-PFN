@@ -102,7 +102,7 @@ def generate_full_multiverse(
         adj:        [n_features, n_features] adjacency matrix
     """
     if randomise_prior:
-        edge_prob  = random.uniform(0.1, 0.5)
+        edge_prob  = random.uniform(0.0, 0.4)   # Include sparse/empty graphs
         do_val     = random.uniform(2.0, 10.0)   # reduced ceiling: keep within [-20, 20] borders
         sigma_exo  = random.uniform(0.5, 2.0)    # reduced ceiling to stay in range
         noise_type = random.choice(["gaussian", "laplace"])

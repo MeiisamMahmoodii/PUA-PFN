@@ -46,9 +46,10 @@ def sparsity_loss(
     true_deltas = (true_targets - obs_means.unsqueeze(0)).abs()   # [K, s, f]
     pred_deltas = (pred_means   - obs_means.unsqueeze(0)).abs()   # [K, s, f]
 
-    # Scale-adaptive threshold: 20% of the per-universe 75th-percentile delta
+    # Stricter scale-adaptive threshold: 5% of the per-universe 75th-percentile delta
+    # This forces the model to be much more sensitive to non-causal noise.
     scale = true_deltas.reshape(true_deltas.shape[0], -1).quantile(0.75, dim=-1)  # [K]
-    threshold = (0.20 * scale).clamp(min=0.1)   # at least 0.1 absolute
+    threshold = (0.05 * scale).clamp(min=0.1)   # at least 0.1 absolute
 
     # Expand threshold to match [K, s, f]
     thr = threshold.view(-1, 1, 1).expand_as(true_deltas)
@@ -117,7 +118,11 @@ class Trainer:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.writer  = SummaryWriter(str(self.log_dir))
-        self.history = {"epoch": [], "loss": [], "nll": [], "sparsity": [], "lr": [], "val_f1": []}
+        self.history = {
+            "epoch": [], "loss": [], "nll": [], "nll_infer": [], 
+            "sparsity": [], "gate_bce": [], "gate_density": [], "lr": [], "val_f1": []
+        }
+
 
         # Early stopping
         self.best_f1      = 0.0
@@ -133,9 +138,9 @@ class Trainer:
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         self.model.train()
 
-        # Anneal Gumbel-Sigmoid temperature: 2.0 → 0.3 over training
+        # Anneal Gumbel-Sigmoid temperature: 2.0 → 0.1 over 500 epochs
         self.model.causal_gate.anneal_temperature(
-            epoch, start_temp=2.0, end_temp=0.3, n_epochs=1500
+            epoch, start_temp=2.0, end_temp=0.1, n_epochs=500
         )
 
         # ── Generate diverse SCM ────────────────────────────────────── #
@@ -165,7 +170,7 @@ class Trainer:
         gate_bce = self.model.causal_gate.bce_loss(obs_ctx, adj)
 
         # ── Gate sparsity: prevent gate from predicting all-ones ──────── #
-        gate_sp = self.model.causal_gate.sparsity_loss(obs_ctx, target_density=0.3)
+        gate_sp = self.model.causal_gate.sparsity_loss(obs_ctx, target_density=0.15)
 
         # ── Output sparsity loss ─────────────────────────────────────── #
         obs_world = m_data[0]
@@ -182,13 +187,17 @@ class Trainer:
         logits_inf, _ = self.model.infer(obs_data, k_infer, do_val_inf)
         nll_infer = self.model.bar_head.nll_loss(logits_inf, true_int_k)
 
+        # ── Gate entropy: force decisions to be binary (0 or 1) ──────── #
+        gate_ent = self.model.causal_gate.entropy_loss(obs_ctx)
+
         # ── Total loss ───────────────────────────────────────────────── #
         # NLL is primary; infer NLL trains obs-only pathway; BCE/sparsity are auxiliary
         loss = (nll
-                + self.lambda_sparsity * sp_loss
+                + 0.3 * sp_loss        # Doubled: push non-descendants harder to 0
                 + self.lambda_infer    * nll_infer
-                + 0.2 * gate_bce
-                + 0.05 * gate_sp)
+                + 1.0 * gate_bce       # Doubled: penalize incorrect edge logic more
+                + 0.2 * gate_sp        # Doubled: encourage lower edge density
+                + 0.15 * gate_ent)     # Increased: push harder for binary decisions
 
         # ── NaN guard ────────────────────────────────────────────────── #
         if not torch.isfinite(loss):
@@ -211,10 +220,8 @@ class Trainer:
             else:
                 raise
 
-        self.scheduler.step()
-
         gate_density = gate.detach().mean().item()
-        return {
+        stats = {
             "loss":         loss.item(),
             "nll":          nll.item(),
             "nll_infer":    nll_infer.item(),
@@ -222,6 +229,20 @@ class Trainer:
             "gate_bce":     gate_bce.item(),
             "gate_density": gate_density,
         }
+
+        # Log everything to history
+        self.history["epoch"].append(epoch)
+        for k, v in stats.items():
+            if k in self.history:
+                self.history[k].append(v)
+        self.history["lr"].append(self.optimizer.param_groups[0]["lr"])
+
+        if (epoch + 1) % 100 == 0:
+            self.writer.add_scalar("train/gate_bce", stats["gate_bce"], epoch)
+            self.writer.add_scalar("train/gate_density", stats["gate_density"], epoch)
+            self.writer.add_scalar("train/nll_infer", stats["nll_infer"], epoch)
+
+        return stats
 
     # ------------------------------------------------------------------ #
     #  Validation                                                          #
@@ -276,12 +297,6 @@ class Trainer:
         for epoch in pbar:
             stats = self.train_epoch(epoch)
             loss, nll, sp = stats["loss"], stats["nll"], stats["sparsity"]
-
-            self.history["epoch"].append(epoch)
-            self.history["loss"].append(loss)
-            self.history["nll"].append(nll)
-            self.history["sparsity"].append(sp)
-            self.history["lr"].append(self.optimizer.param_groups[0]["lr"])
 
             if (epoch + 1) % log_interval == 0:
                 pbar.set_postfix({"NLL": f"{nll:.4f}", "sp": f"{sp:.4f}"})

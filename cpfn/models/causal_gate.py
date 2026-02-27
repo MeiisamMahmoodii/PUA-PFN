@@ -49,13 +49,15 @@ class CausalGate(nn.Module):
         self.temperature = temperature
 
         # MLP: obs_context_pooled → K×K edge logits
+        # Global Mean pooling: [embed_dim] → results
         self.edge_predictor = nn.Sequential(
-            nn.Linear(embed_dim, hidden_dim),
+            nn.Linear(embed_dim, hidden_dim * 2),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(hidden_dim * 2, hidden_dim * 2),
             nn.ReLU(),
-            nn.Linear(hidden_dim, n_features * n_features),
+            nn.Linear(hidden_dim * 2, n_features * n_features),
         )
+
 
         # Diagonal mask buffer (no self-loops, always)
         diag_mask = 1.0 - torch.eye(n_features)
@@ -74,8 +76,8 @@ class CausalGate(nn.Module):
         Returns:
             gate: [K, K]  soft (0,1) or hard {0,1} edge mask
         """
-        # Pool over tokens: mean across sequence dimension → [embed_dim]
-        ctx = obs_context.mean(dim=1).squeeze(0)   # [embed_dim]
+        # Pool Global Mean: [1, s*f, embed_dim] → [embed_dim]
+        ctx = obs_context.mean(dim=1).flatten()   # [embed_dim]
 
         # Predict edge logits
         logits = self.edge_predictor(ctx).view(self.n_features, self.n_features)
@@ -101,17 +103,17 @@ class CausalGate(nn.Module):
         [K, K] edge probabilities (no noise) given obs_context.
         Use for evaluation and monitoring.
         """
-        ctx    = obs_context.mean(dim=1).squeeze(0)
+        ctx    = obs_context.mean(dim=1).flatten()
         logits = self.edge_predictor(ctx).view(self.n_features, self.n_features)
+
         probs  = torch.sigmoid(logits) * self.diag_mask
         return probs.clamp(0.0, 1.0)
 
-    def hard_adjacency(self, obs_context: torch.Tensor, threshold: float = 0.15) -> torch.Tensor:
+    def hard_adjacency(self, obs_context: torch.Tensor, threshold: float = 0.35) -> torch.Tensor:
         """
         [K, K] binary adjacency matrix given obs_context.
-        Default threshold 0.15: BCE-trained gate probs settle at ~0.01-0.02 for
-        non-edges and ~0.25-0.35 for causal edges, so 0.15 cleanly separates them.
-        Adjust if scale changes significantly.
+        Improved threshold 0.35: reduces False Positives by being more conservative
+        than the previous 0.15 baseline.
         """
         return (self.edge_probs(obs_context) > threshold).float()
 
@@ -128,8 +130,9 @@ class CausalGate(nn.Module):
             obs_context: [1, s*f, embed_dim]
             true_adj:    [K, K] float (0/1)
         """
-        ctx    = obs_context.mean(dim=1).squeeze(0)
+        ctx    = obs_context.mean(dim=1).flatten()
         logits = self.edge_predictor(ctx).view(self.n_features, self.n_features)
+
         # Only compute loss on off-diagonal entries
         off_diag  = self.diag_mask.bool()
         return F.binary_cross_entropy_with_logits(
@@ -137,17 +140,25 @@ class CausalGate(nn.Module):
             true_adj[off_diag].float(),
         )
 
-    def sparsity_loss(self, obs_context: torch.Tensor, target_density: float = 0.3) -> torch.Tensor:
+    def sparsity_loss(self, obs_context: torch.Tensor, target_density: float = 0.1) -> torch.Tensor:
         """Encourage ~target_density fraction of edges to be predicted ON."""
         probs     = self.edge_probs(obs_context)
         mean_prob = probs.sum() / self.diag_mask.sum()
         return (mean_prob - target_density).pow(2)
 
+    def entropy_loss(self, obs_context: torch.Tensor) -> torch.Tensor:
+        """Force probabilities towards 0 or 1. Penalizes uncertainty."""
+        probs = self.edge_probs(obs_context)
+        # Entropy H = -p*log(p) - (1-p)*log(1-p)
+        # Simplified as p*(1-p) which peaks at 0.5
+        entropy = probs * (1 - probs)
+        return entropy.mean()
+
     def anneal_temperature(
         self, epoch: int,
         start_temp: float = 2.0,
-        end_temp: float = 0.3,
-        n_epochs: int = 1000,
+        end_temp: float = 0.1,  # Lowered from 0.3 for sharper binary decisions
+        n_epochs: int = 500,
     ):
         frac = min(epoch / n_epochs, 1.0)
         self.temperature = start_temp + frac * (end_temp - start_temp)
